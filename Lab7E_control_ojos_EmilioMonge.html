@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lab 7E - Control de Ojos y Dirección de Mirada</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.5/dist/face-landmarks-detection.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Arial, sans-serif;
+      color: #f8fafc;
+      background: #020617;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-width: 320px;
+      min-height: 100vh;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    #webcam,
+    #overlay {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    #webcam {
+      object-fit: cover;
+      transform: scaleX(-1);
+      background: #020617;
+    }
+
+    #overlay { pointer-events: none; }
+
+    .hud {
+      position: fixed;
+      z-index: 2;
+      top: max(16px, env(safe-area-inset-top));
+      left: 50%;
+      display: flex;
+      gap: 16px;
+      padding: 10px 16px;
+      border: 1px solid rgba(226, 232, 240, 0.25);
+      border-radius: 14px;
+      background: rgba(2, 6, 23, 0.78);
+      transform: translateX(-50%);
+      backdrop-filter: blur(8px);
+    }
+
+    .hud-item { min-width: 86px; text-align: center; }
+    .hud-label {
+      display: block;
+      margin-bottom: 3px;
+      color: #cbd5e1;
+      font-size: 12px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .hud-value {
+      font-size: 22px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    #status {
+      position: fixed;
+      z-index: 2;
+      right: 14px;
+      bottom: max(14px, env(safe-area-inset-bottom));
+      left: 14px;
+      width: fit-content;
+      max-width: min(700px, calc(100vw - 28px));
+      margin: 0 auto;
+      padding: 9px 13px;
+      border-radius: 10px;
+      background: rgba(2, 6, 23, 0.78);
+      font-size: 14px;
+      text-align: center;
+      backdrop-filter: blur(8px);
+    }
+
+    .screen-message {
+      position: fixed;
+      z-index: 3;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(2, 6, 23, 0.56);
+    }
+
+    .message-card {
+      width: min(440px, 100%);
+      padding: 28px;
+      border: 1px solid rgba(226, 232, 240, 0.25);
+      border-radius: 18px;
+      background: rgba(15, 23, 42, 0.96);
+      text-align: center;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+    }
+
+    .message-card h1 {
+      margin: 0 0 12px;
+      font-size: clamp(26px, 6vw, 36px);
+    }
+
+    .message-card p {
+      margin: 0 0 20px;
+      color: #cbd5e1;
+      line-height: 1.5;
+    }
+
+    button {
+      padding: 12px 22px;
+      border: 0;
+      border-radius: 10px;
+      background: #38bdf8;
+      color: #082f49;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:hover { background: #7dd3fc; }
+    button:focus-visible { outline: 3px solid white; outline-offset: 3px; }
+    [hidden] { display: none !important; }
+
+    @media (max-width: 480px) {
+      .hud { gap: 6px; padding: 8px; }
+      .hud-item { min-width: 72px; }
+      .hud-value { font-size: 19px; }
+    }
+  </style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="overlay" aria-hidden="true"></canvas>
+
+  <section class="hud" aria-label="Progreso del juego">
+    <div class="hud-item">
+      <span class="hud-label">Puntos</span>
+      <span id="score" class="hud-value">0 / 15</span>
+    </div>
+    <div class="hud-item">
+      <span class="hud-label">Tiempo</span>
+      <span id="timer" class="hud-value">00:00</span>
+    </div>
+    <div class="hud-item">
+      <span class="hud-label">Mirada</span>
+      <span id="gazeDirection" class="hud-value" style="font-size: 15px;">-</span>
+    </div>
+  </section>
+
+  <p id="status" role="status" aria-live="polite">Preparando cámara y detector de iris...</p>
+
+  <section id="message" class="screen-message">
+    <div class="message-card">
+      <h1 id="messageTitle">Juego de control ocular</h1>
+      <p id="messageText">Permite el acceso a la cámara y espera a que se inicie el detector de landmarks faciales e iris.</p>
+      <button id="startButton" type="button" hidden>Empezar</button>
+    </div>
+  </section>
+
+  <script src="sesion_09_ranking.js"></script>
+  <script>
+    const TARGET_SCORE = 15;
+    const DWELL_TIME_MS = 500;
+    const QUADRANTS = ["top-left", "top-right", "bottom-left", "bottom-right"];
+
+    const LEFT_EYE_INDICES = [33, 133, 159, 145, 160, 144, 158, 153, 157, 154, 173, 246];
+    const RIGHT_EYE_INDICES = [362, 263, 386, 374, 387, 373, 385, 380, 384, 381, 398, 466];
+    const LEFT_IRIS_INDEX = 468;
+    const RIGHT_IRIS_INDEX = 473;
+
+    const videoEl = document.getElementById("webcam");
+    const canvasEl = document.getElementById("overlay");
+    const ctx = canvasEl.getContext("2d");
+    const scoreEl = document.getElementById("score");
+    const timerEl = document.getElementById("timer");
+    const gazeDirectionEl = document.getElementById("gazeDirection");
+    const statusEl = document.getElementById("status");
+    const messageEl = document.getElementById("message");
+    const messageTitleEl = document.getElementById("messageTitle");
+    const messageTextEl = document.getElementById("messageText");
+    const startButtonEl = document.getElementById("startButton");
+
+    let detector = null;
+    let stream = null;
+    let animationFrameId = null;
+    let running = true;
+    let gameStarted = false;
+    let gameFinished = false;
+    let score = 0;
+    let targetQuadrant = null;
+    let currentQuadrant = null;
+    let startedAt = 0;
+    let dwellStartedAt = null;
+    let lastTimerUpdate = 0;
+
+    let smoothRelX = null;
+    let smoothRelY = null;
+    let lastEyeData = null;
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function resizeCanvas() {
+      const pixelRatio = window.devicePixelRatio || 1;
+      canvasEl.width = Math.round(window.innerWidth * pixelRatio);
+      canvasEl.height = Math.round(window.innerHeight * pixelRatio);
+      ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      drawOverlay();
+    }
+
+    function mapPoint(point) {
+      const sourceWidth = videoEl.videoWidth;
+      const sourceHeight = videoEl.videoHeight;
+      if (!sourceWidth || !sourceHeight) return { x: 0, y: 0 };
+
+      const scale = Math.max(window.innerWidth / sourceWidth, window.innerHeight / sourceHeight);
+      const offsetX = (window.innerWidth - sourceWidth * scale) / 2;
+      const offsetY = (window.innerHeight - sourceHeight * scale) / 2;
+
+      const px = point.x <= 1 && point.x >= 0 ? point.x * sourceWidth : point.x;
+      const py = point.y <= 1 && point.y >= 0 ? point.y * sourceHeight : point.y;
+
+      const mirroredX = sourceWidth - px;
+      return {
+        x: offsetX + mirroredX * scale,
+        y: offsetY + py * scale,
+      };
+    }
+
+    function getEyeGaze(contourIndices, irisIndex, keypoints) {
+      const contourPoints = contourIndices.map((idx) => mapPoint(keypoints[idx]));
+      const irisPoint = mapPoint(keypoints[irisIndex]);
+
+      const xs = contourPoints.map((p) => p.x);
+      const ys = contourPoints.map((p) => p.y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const width = maxX - minX || 1;
+      const height = maxY - minY || 1;
+
+      return {
+        contourPoints,
+        irisPoint,
+        relX: (irisPoint.x - minX) / width,
+        relY: (irisPoint.y - minY) / height,
+      };
+    }
+
+    function drawEyeContour(points) {
+      if (!points || points.length === 0) return;
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function drawIris(iris) {
+      if (!iris) return;
+      ctx.beginPath();
+      ctx.arc(iris.x, iris.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = "#22c55e";
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#ffffff";
+      ctx.stroke();
+    }
+
+    function drawOverlay() {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const middleX = width / 2;
+      const middleY = height / 2;
+      ctx.clearRect(0, 0, width, height);
+
+      if (targetQuadrant) {
+        const x = targetQuadrant.endsWith("left") ? 0 : middleX;
+        const y = targetQuadrant.startsWith("top") ? 0 : middleY;
+        ctx.fillStyle = "rgba(34, 197, 94, 0.30)";
+        ctx.fillRect(x, y, middleX, middleY);
+        ctx.strokeStyle = "rgba(134, 239, 172, 0.95)";
+        ctx.lineWidth = 5;
+        ctx.strokeRect(x + 3, y + 3, middleX - 6, middleY - 6);
+      }
+
+      ctx.strokeStyle = "rgba(248, 250, 252, 0.72)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(middleX, 0);
+      ctx.lineTo(middleX, height);
+      ctx.moveTo(0, middleY);
+      ctx.lineTo(width, middleY);
+      ctx.stroke();
+
+      if (lastEyeData) {
+        drawEyeContour(lastEyeData.leftEye.contourPoints);
+        drawEyeContour(lastEyeData.rightEye.contourPoints);
+        drawIris(lastEyeData.leftEye.irisPoint);
+        drawIris(lastEyeData.rightEye.irisPoint);
+      }
+    }
+
+    function formatTime(milliseconds) {
+      const totalSeconds = Math.floor(milliseconds / 1000);
+      const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
+      const seconds = (totalSeconds % 60).toString().padStart(2, "0");
+      return `${minutes}:${seconds}`;
+    }
+
+    function chooseNextQuadrant(previous) {
+      const options = QUADRANTS.filter((quadrant) => quadrant !== previous);
+      targetQuadrant = options[Math.floor(Math.random() * options.length)];
+      dwellStartedAt = null;
+      drawOverlay();
+    }
+
+    function finishGame(now) {
+      gameFinished = true;
+      gameStarted = false;
+      targetQuadrant = null;
+      dwellStartedAt = null;
+      const elapsedMs = now - startedAt;
+      timerEl.textContent = formatTime(elapsedMs);
+      drawOverlay();
+      if (typeof showGameRanking === "function") {
+        showGameRanking({
+          gameId: "control-ojos",
+          elapsedMs,
+          completionMessage: `Has conseguido los ${TARGET_SCORE} puntos en ${formatTime(elapsedMs)}.`,
+        });
+      }
+      setStatus("¡Enhorabuena! Has completado el juego.");
+    }
+
+    function startGame() {
+      score = 0;
+      scoreEl.textContent = `0 / ${TARGET_SCORE}`;
+      timerEl.textContent = "00:00";
+      startedAt = performance.now();
+      lastTimerUpdate = 0;
+      gameStarted = true;
+      gameFinished = false;
+      messageEl.hidden = true;
+      startButtonEl.hidden = true;
+      chooseNextQuadrant(null);
+      setStatus("Dirige la mirada hacia el cuadrante iluminado.");
+    }
+
+    function handleGaze(keypoints, now) {
+      const leftEye = getEyeGaze(LEFT_EYE_INDICES, LEFT_IRIS_INDEX, keypoints);
+      const rightEye = getEyeGaze(RIGHT_EYE_INDICES, RIGHT_IRIS_INDEX, keypoints);
+      lastEyeData = { leftEye, rightEye };
+
+      const avgRelX = (leftEye.relX + rightEye.relX) / 2;
+      const avgRelY = (leftEye.relY + rightEye.relY) / 2;
+
+      smoothRelX = smoothRelX === null ? avgRelX : smoothRelX * 0.65 + avgRelX * 0.35;
+      smoothRelY = smoothRelY === null ? avgRelY : smoothRelY * 0.65 + avgRelY * 0.35;
+
+      const isLeft = smoothRelX < 0.50;
+      const isTop = smoothRelY < 0.50;
+      currentQuadrant = `${isTop ? "top" : "bottom"}-${isLeft ? "left" : "right"}`;
+
+      const labelH = isLeft ? "IZQ" : "DER";
+      const labelV = isTop ? "ARRIBA" : "ABAJO";
+      gazeDirectionEl.textContent = `${labelV}-${labelH}`;
+
+      drawOverlay();
+
+      if (!gameStarted || gameFinished) return;
+
+      if (now - lastTimerUpdate >= 200) {
+        timerEl.textContent = formatTime(now - startedAt);
+        lastTimerUpdate = now;
+      }
+
+      if (currentQuadrant === targetQuadrant) {
+        if (dwellStartedAt === null) dwellStartedAt = now;
+        if (now - dwellStartedAt >= DWELL_TIME_MS) {
+          score += 1;
+          scoreEl.textContent = `${score} / ${TARGET_SCORE}`;
+          if (score >= TARGET_SCORE) {
+            finishGame(now);
+          } else {
+            chooseNextQuadrant(targetQuadrant);
+            setStatus("¡Punto! Mira al siguiente cuadrante iluminado.");
+          }
+        }
+      } else {
+        dwellStartedAt = null;
+      }
+    }
+
+    async function detectLoop() {
+      if (!running || !detector) return;
+      try {
+        const faces = await detector.estimateFaces(videoEl);
+        if (!running) return;
+
+        if (!faces.length) {
+          lastEyeData = null;
+          dwellStartedAt = null;
+          drawOverlay();
+          if (!gameFinished) setStatus("No se detecta rostro. Mira de frente a la cámara con buena luz.");
+        } else {
+          const keypoints = faces[0].keypoints;
+          if (keypoints && keypoints.length >= 478) {
+            handleGaze(keypoints, performance.now());
+            if (!gameFinished && gameStarted) {
+              setStatus("Mirada activa: mantén la vista en el cuadrante iluminado.");
+            }
+          } else {
+            if (!gameFinished) setStatus("Detectando rostro... buscando landmarks de iris.");
+          }
+        }
+      } catch (error) {
+        console.error("Error durante la detección:", error);
+      }
+
+      if (running) animationFrameId = requestAnimationFrame(detectLoop);
+    }
+
+    async function start() {
+      try {
+        setStatus("Solicitando acceso a la cámara...");
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        });
+        videoEl.srcObject = stream;
+        await videoEl.play();
+
+        setStatus("Cargando detector de malla facial e iris...");
+        detector = await faceLandmarksDetection.createDetector(
+          faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
+          {
+            runtime: "mediapipe",
+            solutionPath: "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619",
+            refineLandmarks: true,
+            maxFaces: 1,
+          }
+        );
+
+        messageTitleEl.textContent = "Juego de control ocular";
+        messageTextEl.textContent = "Consigue 15 puntos dirigiendo la mirada hacia el cuadrante iluminado. Mantén la vista fija un instante para puntuar.";
+        startButtonEl.textContent = "Empezar";
+        startButtonEl.hidden = false;
+        setStatus("Detector listo. Pulsa «Empezar».");
+        detectLoop();
+      } catch (error) {
+        console.error("Error al inicializar la app:", error);
+        messageTitleEl.textContent = "No se pudo iniciar el juego";
+        messageTextEl.textContent = `No se pudo iniciar: ${error.message || error}. Comprueba los permisos de cámara y abre la página desde localhost o HTTPS.`;
+        setStatus(`No se pudo iniciar: ${error.message || error}`);
+        stream?.getTracks().forEach((track) => track.stop());
+        stream = null;
+      }
+    }
+
+    function cleanup() {
+      running = false;
+      if (animationFrameId !== null) {
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+      }
+      stream?.getTracks().forEach((track) => track.stop());
+      stream = null;
+      detector?.dispose?.();
+      detector = null;
+    }
+
+    startButtonEl.addEventListener("click", startGame);
+    window.addEventListener("resize", resizeCanvas);
+    window.addEventListener("pagehide", cleanup);
+    resizeCanvas();
+    start();
+  </script>
+</body>
+</html>
